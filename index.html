@@ -321,7 +321,6 @@ input[type=color].wbclr{width:21px;height:21px;border:none;padding:0;border-radi
     <button class="btn act" id="b-nav" onclick="setMode('nav')">تصفح</button>
     <button class="btn" id="b-pen" onclick="setMode('pen')">قلم</button>
     <button class="btn" id="b-era" onclick="setMode('era')">ممحاة</button>
-    <button class="btn" id="b-txt" onclick="setMode('txt')">نص</button>
     <button class="btn" id="b-mark" onclick="setMode('mark')">تظليل</button>
   </div>
 </div>
@@ -465,7 +464,6 @@ input[type=color].wbclr{width:21px;height:21px;border:none;padding:0;border-radi
     <div class="wbtool" id="wbt-circ" onclick="setWBTool('circ')" title="دائرة">◯<span class="wbtool-tip">دائرة</span></div>
     <div class="wbtool" id="wbt-arr" onclick="setWBTool('arr')" title="سهم">➡<span class="wbtool-tip">سهم</span></div>
     <div class="wbtool" id="wbt-era" onclick="setWBTool('era')" title="ممحاة">⬜<span class="wbtool-tip">ممحاة</span></div>
-    <div class="wbtool" id="wbt-txt" onclick="setWBTool('txt')" title="نص">T<span class="wbtool-tip">نص</span></div>
     <div class="wbsep"></div>
     <div style="display:flex;flex-direction:column;gap:2px">
       <div class="sw-lbl">القلم</div>
@@ -680,14 +678,21 @@ window.addEventListener('mouseup', function() {
 var tArr = [], lastPD = 0;
 arena.addEventListener('touchstart', function(e) {
   tArr = Array.from(e.touches);
-  if (tArr.length === 1 && MODE === 'nav') {
-    panning = true;
-    panS = { x: tArr[0].clientX, y: tArr[0].clientY };
-    panO = { x: tx, y: ty };
-  } else if (tArr.length === 2) {
+  if (tArr.length === 2) {
     lastPD = Math.hypot(tArr[0].clientX - tArr[1].clientX, tArr[0].clientY - tArr[1].clientY);
+    return;
   }
-}, { passive: true });
+  if (tArr.length === 1) {
+    if (MODE === 'nav' || spaceDown) {
+      panning = true;
+      panS = { x: tArr[0].clientX, y: tArr[0].clientY };
+      panO = { x: tx, y: ty };
+    } else if (MODE !== 'nav') {
+      e.preventDefault();
+      onDrawStart(tArr[0]);
+    }
+  }
+}, { passive: false });
 
 arena.addEventListener('touchmove', function(e) {
   if (e.touches.length === 2) {
@@ -700,10 +705,19 @@ arena.addEventListener('touchmove', function(e) {
     tx = panO.x + (e.touches[0].clientX - panS.x);
     ty = panO.y + (e.touches[0].clientY - panS.y);
     applyT(false);
+    return;
   }
-}, { passive: true });
+  if (drawing && e.touches.length === 1) {
+    e.preventDefault();
+    onDrawMove(e.touches[0]);
+  }
+}, { passive: false });
 
-arena.addEventListener('touchend', function() { panning = false; tArr = []; lastPD = 0; });
+arena.addEventListener('touchend', function(e) {
+  if (panning) { panning = false; tArr = []; lastPD = 0; return; }
+  if (drawing) onDrawEnd();
+  tArr = []; lastPD = 0;
+});
 
 // ---- Draw system ----
 var PEN = { sz: 4, op: 1 };
@@ -713,6 +727,10 @@ var color = '#e05252';
 var drawing = false, lx = 0, ly = 0;
 var drawCanvas = null, dctx = null;
 var layers = {}, curKey = 'default', undoSt = [];
+// smooth draw
+var _rafPending = false;
+var _pendingX = 0, _pendingY = 0;
+var _dcRect = null; // cached bounding rect
 
 function initDC() {
   if (drawCanvas) drawCanvas.remove();
@@ -770,24 +788,27 @@ function clearAllLayers() {
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
 }
 
-var mLbl = { nav:'تصفح', pen:'قلم — رسم', era:'ممحاة', txt:'نص', mark:'تظليل' };
+var mLbl = { nav:'تصفح', pen:'قلم — رسم', era:'ممحاة', mark:'تظليل' };
 
 function setMode(m) {
   MODE = m;
   peOn = false;
-  ['nav','pen','era','txt','mark'].forEach(function(id) {
+  ['nav','pen','era','mark'].forEach(function(id) {
     var el = document.getElementById('b-' + id);
     if (el) el.classList.toggle('act', id === m);
   });
   if (m === 'nav') {
-    if (drawCanvas) drawCanvas.style.pointerEvents = 'none';
+    if (drawCanvas) { drawCanvas.style.pointerEvents = 'none'; drawCanvas.style.touchAction = ''; }
+    arena.style.touchAction = 'none';
     mbadge.classList.remove('show');
     arena.style.cursor = '';
   } else {
     if (drawCanvas) {
       drawCanvas.style.pointerEvents = 'all';
+      drawCanvas.style.touchAction = 'none';
       drawCanvas.style.cursor = m === 'era' ? 'cell' : 'crosshair';
     }
+    arena.style.touchAction = 'none';
     mbadge.textContent = mLbl[m];
     mbadge.classList.add('show');
   }
@@ -795,9 +816,9 @@ function setMode(m) {
 }
 
 function cpPos(e) {
-  var rect = drawCanvas.getBoundingClientRect();
+  if (!_dcRect) _dcRect = drawCanvas.getBoundingClientRect();
   var cl = (e.clientX !== undefined) ? e : (e.touches && e.touches[0] ? e.touches[0] : e);
-  return { x: (cl.clientX - rect.left) / sc, y: (cl.clientY - rect.top) / sc };
+  return { x: (cl.clientX - _dcRect.left) / sc, y: (cl.clientY - _dcRect.top) / sc };
 }
 
 function applyPS() {
@@ -821,49 +842,48 @@ function activeSz() { return MODE === 'era' ? ERA.sz : PEN.sz; }
 
 function onDrawStart(e) {
   if (MODE === 'nav' || peOn) return;
-  if (MODE === 'txt') { doText(e); return; }
   drawing = true;
+  _dcRect = drawCanvas.getBoundingClientRect(); // refresh rect on start
   var p = cpPos(e);
   lx = p.x; ly = p.y;
+  _pendingX = lx; _pendingY = ly;
+  // setup context once per stroke - RAF reads these
+  var sz = activeSz();
   applyPS();
+  dctx.lineWidth = sz;
+  dctx.lineCap = 'round';
+  dctx.lineJoin = 'round';
   dctx.beginPath();
-  dctx.arc(lx, ly, activeSz() / 2, 0, Math.PI * 2);
+  dctx.arc(lx, ly, sz / 2, 0, Math.PI * 2);
   dctx.fill();
 }
 
 function onDrawMove(e) {
   if (!drawing || peOn) return;
   var p = cpPos(e);
-  dctx.lineWidth = activeSz();
-  dctx.lineCap = 'round';
-  dctx.lineJoin = 'round';
-  applyPS();
+  _pendingX = p.x; _pendingY = p.y;
+  if (!_rafPending) {
+    _rafPending = true;
+    requestAnimationFrame(_rafDraw);
+  }
+}
+
+function _rafDraw() {
+  _rafPending = false;
+  if (!drawing) return;
   dctx.beginPath();
   dctx.moveTo(lx, ly);
-  dctx.lineTo(p.x, p.y);
+  dctx.lineTo(_pendingX, _pendingY);
   dctx.stroke();
-  lx = p.x; ly = p.y;
+  lx = _pendingX; ly = _pendingY;
 }
 
 function onDrawEnd() {
   if (!drawing) return;
+  _rafPending = false;
   drawing = false;
+  _dcRect = null; // invalidate cache
   dctx.globalCompositeOperation = 'source-over';
-  saveLayer();
-}
-
-function doText(e) {
-  var p = cpPos(e);
-  var t = prompt('النص:');
-  if (!t) return;
-  var h = color.replace('#', '');
-  var rv = parseInt(h.slice(0, 2), 16);
-  var gv = parseInt(h.slice(2, 4), 16);
-  var bv = parseInt(h.slice(4, 6), 16);
-  dctx.globalCompositeOperation = 'source-over';
-  dctx.fillStyle = 'rgba(' + rv + ',' + gv + ',' + bv + ',' + PEN.op + ')';
-  dctx.font = 'bold ' + Math.max(PEN.sz * 5, 16) + 'px "Tajawal",Arial';
-  dctx.fillText(t, p.x, p.y);
   saveLayer();
 }
 
@@ -1146,6 +1166,7 @@ var wbctx = wbcv.getContext('2d');
 var wbDrawing = false, wbLx = 0, wbLy = 0;
 var wbSnap = null, wbStart2 = null;
 var wbHist = [], wbIsFS = false, wbOpen_ = false;
+var _wbRafPending = false, _wbPX = 0, _wbPY = 0;
 
 function initWBCanvas() {
   var wrap = document.getElementById('wb-canvas-wrap');
@@ -1196,7 +1217,7 @@ function setWBTool(t) {
   document.querySelectorAll('.wbtool').forEach(function(el) { el.classList.remove('act'); });
   var el = document.getElementById('wbt-' + t);
   if (el) el.classList.add('act');
-  wbcv.style.cursor = t === 'era' ? 'none' : t === 'txt' ? 'text' : 'crosshair';
+  wbcv.style.cursor = t === 'era' ? 'none' : 'crosshair';
   document.getElementById('wb-era-ring').style.display = t === 'era' ? 'block' : 'none';
 }
 
@@ -1250,7 +1271,6 @@ wbcv.addEventListener('touchmove',  function(e) { e.preventDefault(); wbMove(e);
 wbcv.addEventListener('touchend',   function(e) { e.preventDefault(); wbUp(e);   }, { passive: false });
 
 function wbDown(e) {
-  if (WB.tool === 'txt') { wbDoText(e); return; }
   wbDrawing = true;
   var p = wbPos(e);
   wbLx = p.x; wbLy = p.y;
@@ -1258,7 +1278,11 @@ function wbDown(e) {
   wbSaveSnap(); wbPushH();
   if (WB.tool === 'pen' || WB.tool === 'era' || WB.tool === 'mark') {
     var sz = WB.tool === 'era' ? WB.eraSz : WB.sz;
+    _wbPX = p.x; _wbPY = p.y;
     wbApply();
+    wbctx.lineWidth = sz;
+    wbctx.lineCap = 'round';
+    wbctx.lineJoin = 'round';
     wbctx.beginPath();
     wbctx.arc(p.x, p.y, sz / 2, 0, Math.PI * 2);
     wbctx.fill();
@@ -1275,16 +1299,11 @@ function wbMove(e) {
   }
   if (!wbDrawing) return;
   if (WB.tool === 'pen' || WB.tool === 'era' || WB.tool === 'mark') {
-    var sz = WB.tool === 'era' ? WB.eraSz : WB.sz;
-    wbctx.lineWidth = sz;
-    wbctx.lineCap = 'round';
-    wbctx.lineJoin = 'round';
-    wbApply();
-    wbctx.beginPath();
-    wbctx.moveTo(wbLx, wbLy);
-    wbctx.lineTo(p.x, p.y);
-    wbctx.stroke();
-    wbLx = p.x; wbLy = p.y;
+    _wbPX = p.x; _wbPY = p.y;
+    if (!_wbRafPending) {
+      _wbRafPending = true;
+      requestAnimationFrame(_wbRafDraw);
+    }
   } else if ((WB.tool === 'line' || WB.tool === 'rect' || WB.tool === 'circ' || WB.tool === 'arr') && wbSnap) {
     wbctx.drawImage(wbSnap, 0, 0);
     wbctx.globalCompositeOperation = 'source-over';
@@ -1317,19 +1336,20 @@ function wbMove(e) {
   }
 }
 
-function wbUp() {
-  wbDrawing = false;
-  wbctx.globalCompositeOperation = 'source-over';
+function _wbRafDraw() {
+  _wbRafPending = false;
+  if (!wbDrawing) return;
+  wbctx.beginPath();
+  wbctx.moveTo(wbLx, wbLy);
+  wbctx.lineTo(_wbPX, _wbPY);
+  wbctx.stroke();
+  wbLx = _wbPX; wbLy = _wbPY;
 }
 
-function wbDoText(e) {
-  var p = wbPos(e);
-  var t = prompt('النص:');
-  if (!t) return;
-  wbPushH();
-  wbctx.fillStyle = WB.color;
-  wbctx.font = 'bold ' + Math.max(WB.sz * 4, 16) + 'px "Tajawal",Arial';
-  wbctx.fillText(t, p.x, p.y);
+function wbUp() {
+  _wbRafPending = false;
+  wbDrawing = false;
+  wbctx.globalCompositeOperation = 'source-over';
 }
 
 function undoWB() {
