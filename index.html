@@ -732,6 +732,11 @@ var _rafPending = false;
 var _pendingX = 0, _pendingY = 0;
 var _dcRect = null; // cached bounding rect
 
+// Persistent offscreen buffer — source of truth for drawings
+var _mainOff = document.createElement('canvas');
+_mainOff.width = 4000; _mainOff.height = 4000;
+var _mainOffCtx = _mainOff.getContext('2d');
+
 function initDC() {
   if (drawCanvas) drawCanvas.remove();
   drawCanvas = document.createElement('canvas');
@@ -745,15 +750,28 @@ function resizeDC() {
   if (!drawCanvas) return;
   var w = board.offsetWidth || 1100, h = board.offsetHeight || 680;
   if (drawCanvas.width === w && drawCanvas.height === h) return;
-  var tmp = document.createElement('canvas');
-  tmp.width = drawCanvas.width; tmp.height = drawCanvas.height;
-  tmp.getContext('2d').drawImage(drawCanvas, 0, 0);
-  drawCanvas.width = w; drawCanvas.height = h;
-  if (dctx) dctx.drawImage(tmp, 0, 0);
+  // Save current pixels to offscreen BEFORE resizing display canvas
+  _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
+  if (drawCanvas.width > 0 && drawCanvas.height > 0) {
+    _mainOffCtx.drawImage(drawCanvas, 0, 0);
+  }
+  drawCanvas.width = w;
+  drawCanvas.height = h;
+  // Restore from offscreen — no data loss
+  dctx.drawImage(_mainOff, 0, 0);
 }
-new ResizeObserver(resizeDC).observe(board);
+
+var _dcResizeTimer = null;
+new ResizeObserver(function() {
+  clearTimeout(_dcResizeTimer);
+  _dcResizeTimer = setTimeout(resizeDC, 60);
+}).observe(board);
 
 function saveLayer() {
+  // Update offscreen buffer first
+  _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
+  _mainOffCtx.drawImage(drawCanvas, 0, 0);
+  // Save snapshot for undo
   var o = document.createElement('canvas');
   o.width = drawCanvas.width; o.height = drawCanvas.height;
   o.getContext('2d').drawImage(drawCanvas, 0, 0);
@@ -764,7 +782,12 @@ function saveLayer() {
 
 function restoreLayer() {
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-  if (layers[curKey]) dctx.drawImage(layers[curKey], 0, 0);
+  if (layers[curKey]) {
+    dctx.drawImage(layers[curKey], 0, 0);
+    // Sync offscreen
+    _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
+    _mainOffCtx.drawImage(layers[curKey], 0, 0);
+  }
 }
 
 function undoMainDraw() {
@@ -772,7 +795,11 @@ function undoMainDraw() {
   undoSt.pop();
   var prev = undoSt[undoSt.length - 1];
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-  if (prev && prev.k === curKey) dctx.drawImage(prev.img, 0, 0);
+  _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
+  if (prev && prev.k === curKey) {
+    dctx.drawImage(prev.img, 0, 0);
+    _mainOffCtx.drawImage(prev.img, 0, 0);
+  }
   toast('تم التراجع');
 }
 
@@ -780,12 +807,14 @@ function clearCurLayer() {
   if (!confirm('مسح الرسم الحالي؟')) return;
   layers[curKey] = null;
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
 }
 
 function clearAllLayers() {
   if (!confirm('مسح كل الرسومات؟')) return;
   layers = {};
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  _mainOffCtx.clearRect(0, 0, _mainOff.width, _mainOff.height);
 }
 
 var mLbl = { nav:'تصفح', pen:'قلم — رسم', era:'ممحاة', mark:'تظليل' };
@@ -1168,21 +1197,38 @@ var wbSnap = null, wbStart2 = null;
 var wbHist = [], wbIsFS = false, wbOpen_ = false;
 var _wbRafPending = false, _wbPX = 0, _wbPY = 0;
 
+// WB persistent offscreen buffer
+var _wbOff = document.createElement('canvas');
+_wbOff.width = 4000; _wbOff.height = 4000;
+var _wbOffCtx = _wbOff.getContext('2d');
+_wbOffCtx.fillStyle = '#ffffff';
+_wbOffCtx.fillRect(0, 0, _wbOff.width, _wbOff.height);
+
 function initWBCanvas() {
   var wrap = document.getElementById('wb-canvas-wrap');
   var w = Math.max(wrap.clientWidth, 100), h = Math.max(wrap.clientHeight, 100);
   if (wbcv.width === w && wbcv.height === h) return;
-  var tmp = document.createElement('canvas');
-  tmp.width = wbcv.width; tmp.height = wbcv.height;
-  tmp.getContext('2d').drawImage(wbcv, 0, 0);
+  // Save current pixels to offscreen BEFORE resize
+  if (wbcv.width > 0 && wbcv.height > 0) {
+    _wbOffCtx.drawImage(wbcv, 0, 0);
+  }
   wbcv.width = w; wbcv.height = h;
-  wbctx.fillStyle = '#ffffff';
-  wbctx.fillRect(0, 0, w, h);
-  wbctx.drawImage(tmp, 0, 0);
+  // Restore from offscreen — no data loss
+  wbctx.drawImage(_wbOff, 0, 0);
 }
-new ResizeObserver(function() { if (wbOpen_) initWBCanvas(); }).observe(document.getElementById('wb-canvas-wrap'));
+
+var _wbResizeTimer = null;
+new ResizeObserver(function() {
+  if (!wbOpen_) return;
+  clearTimeout(_wbResizeTimer);
+  _wbResizeTimer = setTimeout(initWBCanvas, 60);
+}).observe(document.getElementById('wb-canvas-wrap'));
 
 function openWB(mode) {
+  // Save current WB pixels to offscreen before any resize
+  if (wbcv.width > 0 && wbcv.height > 0) {
+    _wbOffCtx.drawImage(wbcv, 0, 0);
+  }
   wbIsFS = (mode === 'full');
   var p = document.getElementById('wb-panel');
   p.classList.toggle('fs', wbIsFS);
@@ -1193,12 +1239,20 @@ function openWB(mode) {
 }
 
 function closeWB() {
+  // Save to offscreen on close so it survives any later resize
+  if (wbcv.width > 0 && wbcv.height > 0) {
+    _wbOffCtx.drawImage(wbcv, 0, 0);
+  }
   document.getElementById('wb-panel').classList.remove('open');
   wbOpen_ = false;
   document.getElementById('wb-era-ring').style.display = 'none';
 }
 
 function toggleWBFS() {
+  // Save before resize
+  if (wbcv.width > 0 && wbcv.height > 0) {
+    _wbOffCtx.drawImage(wbcv, 0, 0);
+  }
   wbIsFS = !wbIsFS;
   var p = document.getElementById('wb-panel');
   p.classList.toggle('fs', wbIsFS);
@@ -1260,6 +1314,14 @@ function wbPushH() {
   o.getContext('2d').drawImage(wbcv, 0, 0);
   wbHist.push(o);
   if (wbHist.length > 40) wbHist.shift();
+}
+
+// Sync offscreen after every WB stroke ends
+function wbSyncOff() {
+  _wbOffCtx.clearRect(0, 0, _wbOff.width, _wbOff.height);
+  _wbOffCtx.fillStyle = '#ffffff';
+  _wbOffCtx.fillRect(0, 0, _wbOff.width, _wbOff.height);
+  _wbOffCtx.drawImage(wbcv, 0, 0);
 }
 
 wbcv.addEventListener('mousedown', wbDown, { passive: false });
@@ -1350,6 +1412,7 @@ function wbUp() {
   _wbRafPending = false;
   wbDrawing = false;
   wbctx.globalCompositeOperation = 'source-over';
+  wbSyncOff(); // persist stroke to offscreen
 }
 
 function undoWB() {
@@ -1359,6 +1422,7 @@ function undoWB() {
   wbctx.fillStyle = '#ffffff';
   wbctx.fillRect(0, 0, wbcv.width, wbcv.height);
   wbctx.drawImage(prev, 0, 0);
+  wbSyncOff();
   toast('تم التراجع');
 }
 
@@ -1368,6 +1432,9 @@ function clearWB() {
   wbctx.clearRect(0, 0, wbcv.width, wbcv.height);
   wbctx.fillStyle = '#ffffff';
   wbctx.fillRect(0, 0, wbcv.width, wbcv.height);
+  // Reset offscreen to white
+  _wbOffCtx.fillStyle = '#ffffff';
+  _wbOffCtx.fillRect(0, 0, _wbOff.width, _wbOff.height);
   toast('تم مسح السبورة');
 }
 
